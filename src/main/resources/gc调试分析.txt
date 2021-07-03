@@ -1,0 +1,81 @@
+串行gc
+	(1)使用-XX:+UseSerialGC -Xms512m -Xmx512m -XX:+PrintGCDetails -XX:+PrintGCTimeStamps配置结果分析GCLogAnalysis:
+	因为是被缓存的对象所以在每次DefNew后并没有被回收(应用暂停时间0.01-0.03s)，更多是直接晋升到了老年代
+	发生老年代Tenured(应用暂停时间0.1s)，此时产生的问题：大量晋升到老年代，老年代占整体堆内存占比过高，
+	回收效率低且老年代gc频繁停顿时间长，显然这是不可接受的
+	
+	(2)根据步骤1结果进行优化尝试调大堆内存空间-XX:+UseSerialGC -Xms2048m -Xmx2048m -XX:+PrintGCDetails -XX:+PrintGCTimeStamps配置结果分析GCLogAnalysis:
+	调整后最显著结果是老年代Tenured消失了，但是产生了一个新的问题：年轻代DefNew(应用暂停时间0.08-0.1s)
+	这个结果意味着如果分配更多的堆空间可能会导致每次的暂停时间变长，为了验证这个结果将堆内存配置为
+	：-Xms4096m -Xmx4096m，验证结果与预期猜想吻合确实是停顿时间更显著地上升了
+	
+	串行gc总结：没有并行标记、扫描、清理机制所有的操作都是同步阻塞导致性能低下，不适合绝大多数服务端业务使用
+
+	
+并行gc
+	(1)使用-XX:+UseParallelGC -XX:+UseParallelOldGC -Xms1024m -Xmx1024m -XX:+PrintGCDetails -XX:+PrintGCTimeStamps配置结果分析GCLogAnalysis:
+	比较之前的串行gc，Parallel Scavenge年轻代gc(应用暂停时间0.01-0.07s)并且也没有产生大量的full gc，
+	很直观地看出在相同配置下性能确实有所提升，尝试调整-XX:MaxGCPauseMillis -XX:GCTimeRatio参数给予
+	更多的gc占比时间和减少每次最大停顿时间结果是效果并不明显，再次调整-Xmn年轻代大小进行尝试-Xmn256m
+	结果显然不是很理想：显示年轻代虽然内存占比变大了但是其吞吐量确降低了并且老年代的内存减少后晋升
+	老年代的对象难以被清理和后续继续晋升的对象以及巨型对象分配可能会导致OOM(GC日志可见GCLogAnalysis
+	案例缓存数据在晋升到老年代后回收率是相当低的)
+	
+	(2)再次调整将堆内存调整为-Xms1024m -Xmx1024m：现象是没有因为年轻代分配速率过高导致大量涌入
+	老年代从而也没有触发full gc，因此可以认定这是一个较为符合实际场景的配置参数，最后尝试调整
+	-XX:-UseAdaptiveSizePolicy因为通过gc可以看出eden分配的内存较少是默认的自适应开关项导致的，
+	eden区域内存过小会导致younggc频率增加，复制到survivor空间(默认两个survivor)内存是对折的
+	会导致利用率大打折扣，关闭UseAdaptiveSizePolicy并设置-XX:TargetSurvivorRatio=80 -XX:MaxTenuringThreshold=15
+	尽量保证降低晋升速率
+	
+	
+	并行gc总结：并行gc比较串行gc有显著的性能提升，在年轻代使用Parallel Scavenge并行复制收集器提升了回收速率避免大量内存堆积晋升老年代，在老年代使用ParallelOldGC并行标记整理收集器
+			启动参数默认将堆初始内存和最大堆内存设置为相同数据防止因为内存不对齐而导致触发full gc(年轻代空间不足分配到老年代)，UseAdaptiveSizePolicy自适应开关关闭，这个参数
+			会动态调整 Eden、Survivor的大小，Eden、Survivor如果被调整的过大或过小都会造成不同程度的影响，所以关闭自适应并且设置参数-XX:TargetSurvivorRatio -XX:MaxTenuringThreshold
+			将能够更好的将分代收集的理念提升到相对较好的发挥水平线上
+			
+
+			
+parNew&cms
+	(1)使用-XX:+UseParNewGC -XX:+UseConcMarkSweepGC -Xms512m -Xmx512m -XX:+PrintGCDetails -XX:+PrintGCTimeStamps配置结果分析GCLogAnalysis:
+	cms主要是针对老年代的并发标记清除收集器也存在跨代引用Point-out(gc roots存在于年轻代中所以会产生对
+	应的cms扫描年轻代环节)尝试缩小堆内存容量尽可能产生full gc观察cms收集日志，相比较并行gc cms提升效率
+	有了明显的变化，但是随着这些变化cms的阶段也相应的变多了，相比较之下并发预清理阶段与重新标记阶段是暂
+	停时间较长的，所以考虑从这两个点进行尝试优化调整-XX:CMSMaxAbortablePrecleanTime使得并发预清理阶段的
+	最大持续时间进行了控制
+	
+	(2)调整-XX:CMSScheduleRemarkEdenPenetration参数修改进入remark阶段的阈值让eden
+	达到一定值就停止当前阶段并进入remark阶段同时还需要设置下最大持续时间-XX:CMSMaxAbortablePrecleanTime
+	预清理标记阶段时间有所降低，但是remark时间增加了这里是stw显然也是不能接受的，要在abortale preclean
+	与remark阶段找到平衡点尝试的方案是使用CMSScavengeBeforeRemark配置，在remark之前先进行一次年轻代gc
+	结果是remark时间缩短了达到了预期的效果
+	
+	parNew&cms总结：cms使用的是标记清除方式所以有一定的浮动垃圾，尽早执行预清理标记阶段能合理地减少
+					最终cms的停顿时间，abortable preclean时间过长可以调整-XX:CMSMaxAbortablePrecleanTime、
+					-XX:CMSScheduleRemarkEdenPenetration参数，remark时间过长可以调整CMSScavengeBeforeRemark
+					参数在remark阶段前在插入一次年轻代gc,最终目标在于减少老年代对年轻代的引用，降低remark开销
+					cms stw在初次mark和remark阶段，首次mark gc roots对象引用不多所以不会耗费太久时间，大部分
+					开始还是处于remark阶段,最终参数还是要通过实际情况分析的如果采用插入一次Minor gc，实际Minor gc+
+					remark时间大于不插入Minor gc的remark这样的结果才能认为是起到合理优化的作用，还需要根据自身
+					业务进行合理的分析
+					
+g1 gc
+	(1)为了测试g1收集器的性能这里使用了sb压测工具(先设置 -c=1 -N=1，注：N数值设置为1分析得到响应时间是有1000ms差值的，下文设置N的地方也是同理)，
+	设置参数-XX:+UseG1GC Xms2048m -Xmx2048m -XX:MaxGCPauseMillis=200 -XX:+PrintGC
+	配置结果分析GCLogAnalysis(web应用方法内实现GCLogAnalysis generateGarbage方法):如果缓存数组的size设置过高，G1 Humongous Allocation
+	出现的频率会提升也应证了在处理大对象的情况分配至Humongous区，g1同时还包含Normal(young)和mixed两种模式，这两种模式都是stw的，所以
+	还是需要合理地设置MaxGCPauseMillis参数来控制最大的停顿时间，并且需要注意是MaxGCPauseMillis参数设置过大会导致暂停时间过长而设置过短
+	又会导致gc频繁吞吐量下降
+	
+	(2)尝试设置-c=20，-N=2，tp90,99,99的基本持平在1000ms-1200ms之间，再将-c调整为40后tp99的情况就不太理想了高达2500ms，尝试开启-XX:+UseTLAB
+	开关(减少线程同步开销)似乎也没有明显的改善说明此时的数组对象size过大是大对象是无法分配到TLAB上的，尝试扩大堆内存配置，减少数组size最大长度
+	并且调高-XX:G1HeapRegionSize配置参数是处理大对象较好的方式或者在编写设计代码的时候不要使用多维数组和大对象，尽量将大对象拆解和多维数组改用
+	一维数组做分割折叠
+	
+	g1总结：针对g1的设计优点主要在于更细化了隔代分区(缓冲区,大对象区等)并且合理地动态分配年轻代与老年代的区块数量，借鉴了CMS的r set也在r set的
+	基础之上选择了更加实用于自己的point-in模式（年轻代指向老年代）同时也引入了卡片解决了r set存储对象过多的问题，整理来说g1是CMS的进阶版，在保
+	持原有设计优点（卡片标记，三色标记等）也很大程度地提升了老年代垃圾回收的效率
+	缺陷：启动周期标记 mix gc触发前老年代没有多余空间或者gc后存活对象、晋升对象没有多余空间分配以及大对象无法被分配时会触发串行gc，为了避免这种情况
+	的发生可以相应地：1.增大总堆内存 2.预留最高内存配置-XX:G1ReservePercent 3.开启-XX:InitiatingHeapOccupancyPercent提前触发周期标记 4.扩大
+	-XX:G1HeapRegionSize大对象分配区阈值 5.增加设置stw工作线程以及并发标记线程数 6.不做设置固定年轻代的配置 7.根据自身系统业务场景需求适当地调整MaxGCPauseMillis暂停时间
+	
