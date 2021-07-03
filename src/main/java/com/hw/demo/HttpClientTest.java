@@ -53,7 +53,7 @@ public class HttpClientTest {
             HttpClientTest httpClientTest = new HttpClientTest();
             httpClientTest.initHttpClientHelper();
             String result = httpClientTest.executeGet("http://localhost:8801", "name=123");
-            Assert.notEmpty(new Object[]{result}, "must be not null!");
+            Assert.notEmpty(new Object[]{result}, "result must be not null!");
         } catch (Exception e) {
             LOGGER.error("error:", e);
         }
