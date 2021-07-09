@@ -48,7 +48,7 @@ public class HttpClientSync {
         try {
             HttpClientSync httpClientTest = new HttpClientSync();
             httpClientTest.initHttpClientHelper();
-            String result = httpClientTest.executeGet("http://127.0.0.1:8917/get", "now="+System.currentTimeMillis());
+            String result = httpClientTest.executeGet("http://127.0.0.1:8917/query", "now="+System.currentTimeMillis());
             Assert.notEmpty(new Object[]{result}, "result must be not null!");
         } catch (Exception e) {
             LOGGER.error("error:", e);

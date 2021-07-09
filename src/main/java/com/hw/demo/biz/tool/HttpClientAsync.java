@@ -1,5 +1,6 @@
 package com.hw.demo.biz.tool;
 
+import com.hw.demo.biz.bean.UserInfo;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.concurrent.FutureCallback;
@@ -52,6 +53,8 @@ public class HttpClientAsync {
     public void executeGet(String url) {
         initClient();
         final HttpGet httpGet = new HttpGet(url);
+        String subject = JwtUtil.generalSubject(new UserInfo("jaeo", "jackeo"));
+        httpGet.setHeader("token", JwtUtil.createJWT("jwt", subject, 60 * 60 * 1000));
         closeableHttpAsyncClient.execute(httpGet, new FutureCallback<>() {
             @Override
             public void completed(final HttpResponse endpointResponse) {
@@ -91,6 +94,6 @@ public class HttpClientAsync {
 
     public static void main(String[] args) {
         HttpClientAsync asyncClient = HttpClientAsync.getInstance();
-        asyncClient.executeGet("http://127.0.0.1:8888/test");
+        asyncClient.executeGet("http://127.0.0.1:8917/query");
     }
 }
